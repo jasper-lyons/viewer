@@ -112,7 +112,6 @@ module Templates
             # allow values to be overriden by subclasses
             value = self.class.exposures[name][:value] || name
             block = block || self.class.default
-            byebug unless block
             instance_exec(value, &block)
           end
         end
