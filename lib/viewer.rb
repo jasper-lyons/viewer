@@ -3,59 +3,93 @@ require 'set'
 
 module Templates
   class Renderer < Tilt::Template
-    EMBEDDED_PATTERN = /<%(=+|\#)?(.*?)-?%>/m
+    EMBEDDED_PATTERN = /<(%->|%=+|%\#|%)(.*?)-?%>/m
 
     def prepare
       @src = convert(data)
     end
 
     def convert(input)
-      src = "_buf = ''\n"           # preamble
-      pos = 0
-      input.scan(EMBEDDED_PATTERN) do |indicator, code|
-        m = Regexp.last_match
-        text = input[pos...m.begin(0)]
-        pos  = m.end(0)
-        #src << " _buf << '" << escape_text(text) << "';"
-        text.gsub!(/['\\]/, '\\\\\&')
-        src << " _buf << '" << text << "'\n" unless text.empty?
-        if !indicator              # <% %>
-          src << code << "\n"
-        elsif indicator == '#'     # <%# %>
-          src << ("\n" * code.count("\n"))
-        else                       # <%= %>
-          src << " _buf << (respond_to?(:hook) ? hook(\"" << code << "\", binding).to_s : (" << code << ").to_s)\n"
-        end
+      src = <<~RUBY
+      late_bindings = []
+      buffer = ""
+      #{
+        input.split(EMBEDDED_PATTERN).
+          each_slice(3).
+          map { |text, type, code| dispatch_codegenerator(text, type, code) }.
+          join
+      }
+      if late_bindings.empty?
+        return buffer
+      else
+        return format(buffer, *late_bindings.map(&:call))
       end
-      #rest = $' || input                        # ruby1.8
-      rest = pos == 0 ? input : input[pos..-1]   # ruby1.9
-      #src << " _buf << '" << escape_text(rest) << "';"
-      rest.gsub!(/['\\]/, '\\\\\&')
-      src << " _buf << '" << rest << "'\n" unless rest.empty?
-      src << "\n_buf.to_s\n"       # postamble
-      return src
+      RUBY
+      src
     end
 
-    def result(_binding=binding)
-      eval @src, _binding
+    def precompiled_template(locals)
+      @src
     end
 
-    def evaluate(_context=self)
-      if _context.is_a?(Hash)
-        _obj = Object.new
-        _context.each do |k, v| _obj.instance_variable_set("@#{k}", v) end
-        _context = _obj
+    private
+
+    def dispatch_codegenerator(text, type, code)
+      case type
+      when '%'
+        generate_code(text, code)
+      when '%#', nil
+        generate_comment(text)
+      when '%='
+        generate_value_code(text, code)
+      when '%->'
+        generate_late_bound_code(text, code)
+      else
+        generate_error(text, type)
       end
-      _context.instance_eval @src
     end
 
-    alias :render :evaluate
+    def generate_code(text, code)
+      <<~RUBY
+        buffer << #{text.rstrip.inspect}
+        #{code}
+      RUBY
+    end
+
+    def generate_comment(text)
+      <<~RUBY
+        buffer << #{text.rstrip.inspect}
+      RUBY
+    end
+
+    def generate_value_code(text, code)
+      <<~RUBY
+        buffer << #{text.inspect}
+        buffer << (respond_to?(:hook) ? hook(#{code}) : #{code}).to_s
+      RUBY
+    end
+
+    def generate_late_bound_code(text, code)
+      <<~RUBY
+        buffer << #{text.inspect}
+        late_bindings << -> { (#{code}).to_s }
+        buffer << '%s'
+      RUBY
+    end
+
+    def generate_error(text, type)
+      <<~RUBY
+        buffer << #{text.inspect}
+        raise \"Unexpected indicator #{type}\"
+      RUBY
+    end
   end
 
   class Context
     class << self
       attr_writer :exposures
       attr_accessor :default
+
       def exposures
         @exposures ||= Hash.new { |h,k| h[k] = {} }
       end
@@ -103,6 +137,7 @@ module Viewer
       map { |e| "<link rel=\"stylesheet\" type=\"text/css\" href=\"#{e}\">" }.join("\n")
     end
   end
+
   class JSRenderer < Set
     def to_s
       map { |e| "<script src=#{e}></script>" }.join("\n")
@@ -138,7 +173,7 @@ module Viewer
         config.js += view.config.js
       end
     end
-    
+
     def initialize(template: nil, theme: nil, layout: nil, css: nil, js: nil)
       @template = template || self.class.config.template
       @theme = theme || self.class.config.theme
@@ -166,45 +201,29 @@ module Viewer
       @js += view.js
     end
 
-    # introduce a compile step
-    # and a simple render step
-    def hook(code, binding)
-      value = eval(code, binding) 
-      if value.is_a?(Viewer::View)
-        register(value)
-      end
-      lambdas << -> { eval(code, binding) }
-      '%s'
+    def hook(value)
+      value.tap { |v| register(v) if v.is_a?(Viewer::View) }
     end
 
     def lambdas
       @lambdas ||= []
     end
 
-    def compile(context: self, encoding: 'utf-8')
+    def render(context: self, encoding: 'utf-8')
       layout_renderer = if File.exists?(layout_path)
-        Tilt.new(layout_path, default_encoding: encoding)
-      end
+                          Tilt.new(layout_path, default_encoding: encoding)
+                        end
 
       template_renderer = Tilt.new(template_path, default_encoding: encoding)
 
 
-      @compiled_template = if layout_renderer
+      if layout_renderer
         layout_renderer.render(context) do
           template_renderer.render(context)
         end
       else
         template_renderer.render(context)
       end
-    end
-
-    def compiled_template
-      @compiled_template ||= ""
-    end
-
-    def render(context: self, encoding: 'utf-8')
-      template = compile(context: context, encoding: encoding)
-      format(template, *lambdas.map(&:call))
     end
 
     alias :to_s :render
