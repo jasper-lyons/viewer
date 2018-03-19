@@ -1,3 +1,4 @@
+require 'viewer/version'
 require 'tilt'
 require 'set'
 
@@ -131,6 +132,7 @@ end
 Tilt.register Templates::Renderer, 'erb'
 
 module Viewer
+
   class CSSRenderer < Set
     def to_s
       map { |e| "<link rel=\"stylesheet\" type=\"text/css\" href=\"#{e}\">" }.join("\n")
