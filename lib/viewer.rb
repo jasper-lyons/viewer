@@ -1,4 +1,4 @@
-require 'viewer/version'
+require_relative './viewer/version'
 require 'tilt'
 require 'set'
 
@@ -7,6 +7,7 @@ module Templates
     EMBEDDED_PATTERN = /<(%->|%=+|%\#|%)(.*?)-?%>/m
 
     def prepare
+      @line_no = 0
       @src = convert(data)
     end
 
@@ -14,16 +15,23 @@ module Templates
       src = <<~RUBY
       late_bindings = []
       buffer = ""
-      #{
-        input.split(EMBEDDED_PATTERN).
-          each_slice(3).
-          map { |text, type, code| dispatch_codegenerator(text, type, code) }.
-          join
-      }
-      if late_bindings.empty?
-        return buffer
-      else
-        return format(buffer, *late_bindings.map(&:call))
+      line_no = #{@line_no}
+      current_code = ""
+      begin 
+        #{
+          input.
+            split(EMBEDDED_PATTERN).
+            each_slice(3).
+            map { |text, type, code| dispatch_codegenerator(text.gsub('%', '%%'), type, code) }.
+            join
+        }
+        if late_bindings.empty?
+          return buffer
+        else
+          return Kernel.format(buffer, *late_bindings.map(&:call))
+        end
+      rescue => e
+        raise "Error " + e.message + " occured on line " + line_no.to_s + " for code: " + current_code.inspect
       end
       RUBY
       src
@@ -36,6 +44,9 @@ module Templates
     private
 
     def dispatch_codegenerator(text, type, code)
+      @line_no += text&.count("\n") || 0
+      @line_no += code&.count("\n") || 0
+
       case type
       when '%'
         generate_code(text, code)
@@ -53,12 +64,15 @@ module Templates
     def generate_code(text, code)
       <<~RUBY
         buffer << #{text.rstrip.inspect}
+        line_no = #{@line_no} 
+        current_code = "#{code}"
         #{code}
       RUBY
     end
 
     def generate_comment(text)
       <<~RUBY
+        line_no = #{@line_no} 
         buffer << #{text.rstrip.inspect}
       RUBY
     end
@@ -66,20 +80,27 @@ module Templates
     def generate_value_code(text, code)
       <<~RUBY
         buffer << #{text.inspect}
-        buffer << (respond_to?(:hook) ? hook(#{code}) : #{code}).to_s
+        line_no = #{@line_no} 
+        current_code = "#{code}"
+        buffer << (respond_to?(:hook) ? hook(#{code}) : (#{code}) ).to_s
       RUBY
     end
 
     def generate_late_bound_code(text, code)
       <<~RUBY
         buffer << #{text.inspect}
-        late_bindings << -> { (#{code}).to_s }
+        late_bindings << lambda do
+          line_no = #{@line_no} 
+          current_code = "#{code}"
+          (#{code}).to_s
+        end
         buffer << '%s'
       RUBY
     end
 
     def generate_error(text, type)
       <<~RUBY
+        line_no = #{@line_no} 
         buffer << #{text.inspect}
         raise \"Unexpected indicator #{type}\"
       RUBY
@@ -148,7 +169,7 @@ module Viewer
   class View < Templates::Context
     DEFAULT_LAYOUT = 'layout'
     DEFAULT_RENDERER = 'erb'
-    Config = Struct.new(:template, :theme, :layout, :css, :js)
+    Config = Struct.new(:format, :template, :theme, :layout, :css, :js)
 
     class << self
       def configure
@@ -159,6 +180,7 @@ module Viewer
         @config ||= Config.new.tap do |config|
           config.css = CSSRenderer.new
           config.js = JSRenderer.new
+          config.format = 'html'
         end
       end
       attr_writer :config
@@ -175,7 +197,8 @@ module Viewer
       end
     end
 
-    def initialize(template: nil, theme: nil, layout: nil, css: nil, js: nil)
+    def initialize(format: nil, template: nil, theme: nil, layout: nil, css: nil, js: nil)
+      @format = format || self.class.config.format
       @template = template || self.class.config.template
       @theme = theme || self.class.config.theme
       @layout = layout || self.class.config.layout || DEFAULT_LAYOUT
@@ -183,18 +206,18 @@ module Viewer
       @js = self.class.config.js
     end
 
-    attr_reader :template, :theme, :layout
+    attr_reader :format, :template, :theme, :layout
 
     def templates_path_list
       ['templates', theme].compact
     end
 
     def template_path
-      File.join(*templates_path_list, "#{template}.html.#{DEFAULT_RENDERER}")
+      File.join(*templates_path_list, "#{template}.#{format}.#{DEFAULT_RENDERER}")
     end
 
     def layout_path
-      File.join(*templates_path_list, "#{layout}.html.#{DEFAULT_RENDERER}")
+      File.join(*templates_path_list, "#{layout}.#{format}.#{DEFAULT_RENDERER}")
     end
 
     def register(view)
@@ -202,7 +225,7 @@ module Viewer
       @js += view.js
     end
 
-    def hook(value)
+    def hook(value = nil)
       value.tap { |v| register(v) if v.is_a?(Viewer::View) }
     end
 
@@ -217,7 +240,6 @@ module Viewer
 
       template_renderer = Tilt.new(template_path, default_encoding: encoding)
 
-
       if layout_renderer
         layout_renderer.render(context) do
           template_renderer.render(context)
@@ -228,6 +250,11 @@ module Viewer
     end
 
     alias :to_s :render
+
+    # support being a body for Rack::Responses
+    def each
+      yield render
+    end
 
     expose :css do
       @css
